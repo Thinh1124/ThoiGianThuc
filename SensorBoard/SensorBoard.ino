@@ -63,6 +63,18 @@ volatile uint32_t runtimeSec = 0;
 volatile uint8_t pumpState = 0;
 volatile uint32_t mainLastSeenMs = 0;
 
+static void copySensorFrameFromVolatile(SensorFrame &dst, const volatile SensorFrame &src) {
+  memcpy(&dst, (const void *)&src, sizeof(SensorFrame));
+}
+
+static void copyThresholdConfigFromVolatile(ThresholdConfig &dst, const volatile ThresholdConfig &src) {
+  memcpy(&dst, (const void *)&src, sizeof(ThresholdConfig));
+}
+
+static void writeSensorFrameToVolatile(volatile SensorFrame &dst, const SensorFrame &src) {
+  memcpy((void *)&dst, &src, sizeof(SensorFrame));
+}
+
 static bool extractJsonInt(const String &body, const char *key, long &out) {
   String token = "\"";
   token += key;
@@ -168,7 +180,7 @@ void sendConfigToMainBoard() {
   ThresholdConfig snap;
 
   portENTER_CRITICAL(&dataMux);
-  snap = config;
+  copyThresholdConfigFromVolatile(snap, config);
   portEXIT_CRITICAL(&dataMux);
 
   char line[96];
@@ -235,8 +247,8 @@ void pushTelemetryToSupabase() {
   uint8_t mainOnline = 0;
 
   portENTER_CRITICAL(&dataMux);
-  snap = latestFrame;
-  cfg = config;
+  copySensorFrameFromVolatile(snap, latestFrame);
+  copyThresholdConfigFromVolatile(cfg, config);
   rt = runtimeSec;
   pump = pumpState;
   if (mainLastSeenMs > 0 && (millis() - mainLastSeenMs) < 10000UL) {
@@ -323,7 +335,7 @@ void pullConfigFromSupabase() {
 
   if (extractJsonText(body, "pump_mode", modeBuf, sizeof(modeBuf))) {
     if (strcmp(modeBuf, "threshold") == 0 || strcmp(modeBuf, "schedule") == 0 || strcmp(modeBuf, "manual") == 0) {
-      if (strcmp(config.pumpMode, modeBuf) != 0) {
+      if (strcmp((const char *)config.pumpMode, modeBuf) != 0) {
         strncpy((char*)config.pumpMode, modeBuf, sizeof(config.pumpMode) - 1);
         ((char*)config.pumpMode)[sizeof(config.pumpMode) - 1] = '\0';
         changed = true;
@@ -363,7 +375,7 @@ void TaskSensor(void *pvParameters) {
     frame.tsMs = millis();
 
     portENTER_CRITICAL(&dataMux);
-    latestFrame = frame;
+    writeSensorFrameToVolatile(latestFrame, frame);
     portEXIT_CRITICAL(&dataMux);
 
     if (sensorQueue != NULL) {
@@ -440,7 +452,7 @@ void TaskApiSync(void *pvParameters) {
 
     ThresholdConfig snap;
     portENTER_CRITICAL(&dataMux);
-    snap = config;
+    copyThresholdConfigFromVolatile(snap, config);
     portEXIT_CRITICAL(&dataMux);
 
     int8_t overrideMode = calcPumpOverride(snap);
@@ -482,7 +494,11 @@ void setup() {
 
   connectWifi();
   sendConfigToMainBoard();
-  sendPumpOverrideToMainBoard(calcPumpOverride(config));
+  ThresholdConfig cfgSnap;
+  portENTER_CRITICAL(&dataMux);
+  copyThresholdConfigFromVolatile(cfgSnap, config);
+  portEXIT_CRITICAL(&dataMux);
+  sendPumpOverrideToMainBoard(calcPumpOverride(cfgSnap));
 
   sensorQueue = xQueueCreate(1, sizeof(SensorFrame));
 

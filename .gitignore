@@ -1,0 +1,6 @@
+node_modules
+nodemodules
+Frontend/node_modules
+Frontend/dist
+.env
+.env.*

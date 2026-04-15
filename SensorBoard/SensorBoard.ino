@@ -19,13 +19,15 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #define UART_BAUD 9600
 
 // ===== WIFI =====
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID = "baitaplon";
+const char* WIFI_PASS = "12345678";
 
-// ===== REMOTE API SERVER =====
-const char* API_BASE_URL = "http://192.168.1.100:3000";
-const char* API_PUSH_PATH = "/data";     // ESP32 -> server (POST telemetry)
-const char* API_PULL_PATH = "/config";   // server -> ESP32 (GET config)
+// ===== SUPABASE =====
+const char* SUPABASE_URL = "https://jelbdikdlcsufgcneuri.supabase.co";
+const char* SUPABASE_API_KEY = "sb_publishable_ZPz5RRekgXhLQ2hARpOU1w_9U2nEt8v";
+
+const char* SUPABASE_TELEMETRY_PATH = "/rest/v1/telemetry";
+const char* SUPABASE_CONFIG_PATH = "/rest/v1/config?select=dry_threshold,wet_threshold,safe_temp,timeout_ms,pump_mode,manual_trigger&id=eq.1&limit=1";
 
 // ===== TASK PERIOD =====
 static const uint32_t SENSOR_PERIOD_MS = 2000UL;
@@ -45,6 +47,8 @@ typedef struct {
   uint16_t wet;
   uint32_t timeoutMs;
   int8_t safeTemp;
+  char pumpMode[12];
+  bool manualTrigger;
 } ThresholdConfig;
 
 DHT dht(DHTPIN, DHTTYPE);
@@ -54,7 +58,7 @@ QueueHandle_t sensorQueue = NULL;
 portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
 
 volatile SensorFrame latestFrame = {0, 0, 0, 0};
-volatile ThresholdConfig config = {900, 600, 600000UL, 32};
+volatile ThresholdConfig config = {900, 600, 600000UL, 32, "threshold", false};
 volatile uint32_t runtimeSec = 0;
 volatile uint8_t pumpState = 0;
 volatile uint32_t mainLastSeenMs = 0;
@@ -91,6 +95,62 @@ static bool extractJsonInt(const String &body, const char *key, long &out) {
   return true;
 }
 
+static bool extractJsonText(const String &body, const char *key, char *out, size_t outSize) {
+  if (outSize == 0) return false;
+
+  String token = "\"";
+  token += key;
+  token += "\"";
+
+  int p = body.indexOf(token);
+  if (p < 0) return false;
+
+  p = body.indexOf(':', p);
+  if (p < 0) return false;
+  p++;
+
+  while (p < body.length() && (body[p] == ' ' || body[p] == '\t')) p++;
+  if (p >= body.length() || body[p] != '"') return false;
+  p++;
+
+  int start = p;
+  while (p < body.length() && body[p] != '"') p++;
+  if (p <= start) return false;
+
+  String text = body.substring(start, p);
+  size_t n = text.length();
+  if (n >= outSize) n = outSize - 1;
+
+  memcpy(out, text.c_str(), n);
+  out[n] = '\0';
+  return true;
+}
+
+static bool extractJsonBool(const String &body, const char *key, bool &out) {
+  String token = "\"";
+  token += key;
+  token += "\"";
+
+  int p = body.indexOf(token);
+  if (p < 0) return false;
+
+  p = body.indexOf(':', p);
+  if (p < 0) return false;
+  p++;
+
+  while (p < body.length() && (body[p] == ' ' || body[p] == '\t')) p++;
+
+  if (body.startsWith("true", p)) {
+    out = true;
+    return true;
+  }
+  if (body.startsWith("false", p)) {
+    out = false;
+    return true;
+  }
+  return false;
+}
+
 static void parseMainFeedbackLine(char *line) {
   char *p = strstr(line, "P:");
   if (p == NULL) return;
@@ -121,6 +181,28 @@ void sendConfigToMainBoard() {
   Serial.print(line);
 }
 
+void sendSensorToMainBoard(const SensorFrame &frame) {
+  char line[40];
+  snprintf(line, sizeof(line), "T:%d,H:%u,S:%u\n",
+           frame.temperature,
+           frame.humidity,
+           frame.soil);
+  Serial.print(line);
+}
+
+void sendPumpOverrideToMainBoard(int8_t overrideMode) {
+  char line[12];
+  snprintf(line, sizeof(line), "M:%d\n", overrideMode);
+  Serial.print(line);
+}
+
+int8_t calcPumpOverride(const ThresholdConfig &cfg) {
+  if (strcmp(cfg.pumpMode, "manual") == 0 || strcmp(cfg.pumpMode, "schedule") == 0) {
+    return cfg.manualTrigger ? 1 : 0;
+  }
+  return -1;
+}
+
 void connectWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -143,7 +225,7 @@ void reconnectWifiIfNeeded() {
   }
 }
 
-void pushTelemetryToServer() {
+void pushTelemetryToSupabase() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   SensorFrame snap;
@@ -162,38 +244,38 @@ void pushTelemetryToServer() {
   }
   portEXIT_CRITICAL(&dataMux);
 
-  char url[128];
-  snprintf(url, sizeof(url), "%s%s", API_BASE_URL, API_PUSH_PATH);
+  char url[192];
+  snprintf(url, sizeof(url), "%s%s", SUPABASE_URL, SUPABASE_TELEMETRY_PATH);
 
-  char payload[256];
+  char payload[160];
   snprintf(payload, sizeof(payload),
-           "{\"temp\":%d,\"hum\":%u,\"soil\":%u,\"pump\":%u,\"time\":%lu,\"mainOnline\":%u,\"config\":{\"dry\":%u,\"wet\":%u,\"timeout\":%lu,\"safeTemp\":%d}}",
+           "{\"temp\":%d,\"hum\":%u,\"soil\":%u,\"pump_status\":%u}",
            snap.temperature,
            snap.humidity,
            snap.soil,
-           pump,
-           (unsigned long)rt,
-           mainOnline,
-           cfg.dry,
-           cfg.wet,
-           (unsigned long)cfg.timeoutMs,
-           cfg.safeTemp);
+           pump);
 
   HTTPClient http;
   http.begin(url);
+  http.addHeader("apikey", SUPABASE_API_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("Prefer", "return=minimal");
   http.POST((uint8_t*)payload, strlen(payload));
   http.end();
 }
 
-void pullConfigFromServer() {
+void pullConfigFromSupabase() {
   if (WiFi.status() != WL_CONNECTED) return;
 
-  char url[128];
-  snprintf(url, sizeof(url), "%s%s", API_BASE_URL, API_PULL_PATH);
+  char url[256];
+  snprintf(url, sizeof(url), "%s%s", SUPABASE_URL, SUPABASE_CONFIG_PATH);
 
   HTTPClient http;
   http.begin(url);
+  http.addHeader("apikey", SUPABASE_API_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
+  http.addHeader("Accept", "application/json");
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     http.end();
@@ -205,34 +287,54 @@ void pullConfigFromServer() {
 
   bool changed = false;
   long v;
+  char modeBuf[12];
+  modeBuf[0] = '\0';
+  bool manualVal;
+  bool hasManualVal = false;
 
   portENTER_CRITICAL(&dataMux);
-  if (extractJsonInt(body, "dry", v)) {
+  if (extractJsonInt(body, "dry_threshold", v)) {
     if (v >= 0 && v <= 1023 && config.dry != (uint16_t)v) {
       config.dry = (uint16_t)v;
       changed = true;
     }
   }
 
-  if (extractJsonInt(body, "wet", v)) {
+  if (extractJsonInt(body, "wet_threshold", v)) {
     if (v >= 0 && v <= 1023 && config.wet != (uint16_t)v) {
       config.wet = (uint16_t)v;
       changed = true;
     }
   }
 
-  if (extractJsonInt(body, "timeout", v)) {
+  if (extractJsonInt(body, "timeout_ms", v)) {
     if (v >= 1000 && v <= 3600000 && config.timeoutMs != (uint32_t)v) {
       config.timeoutMs = (uint32_t)v;
       changed = true;
     }
   }
 
-  if (extractJsonInt(body, "safeTemp", v)) {
+  if (extractJsonInt(body, "safe_temp", v)) {
     if (v >= -20 && v <= 80 && config.safeTemp != (int8_t)v) {
       config.safeTemp = (int8_t)v;
       changed = true;
     }
+  }
+
+  if (extractJsonText(body, "pump_mode", modeBuf, sizeof(modeBuf))) {
+    if (strcmp(modeBuf, "threshold") == 0 || strcmp(modeBuf, "schedule") == 0 || strcmp(modeBuf, "manual") == 0) {
+      if (strcmp(config.pumpMode, modeBuf) != 0) {
+        strncpy((char*)config.pumpMode, modeBuf, sizeof(config.pumpMode) - 1);
+        ((char*)config.pumpMode)[sizeof(config.pumpMode) - 1] = '\0';
+        changed = true;
+      }
+    }
+  }
+
+  hasManualVal = extractJsonBool(body, "manual_trigger", manualVal);
+  if (hasManualVal && config.manualTrigger != manualVal) {
+    config.manualTrigger = manualVal;
+    changed = true;
   }
   portEXIT_CRITICAL(&dataMux);
 
@@ -298,17 +400,12 @@ void TaskUART(void *pvParameters) {
   (void) pvParameters;
 
   SensorFrame frame;
-  char line[40];
   char rxLine[64];
   uint8_t rxIdx = 0;
 
   for (;;) {
     if (xQueueReceive(sensorQueue, &frame, pdMS_TO_TICKS(100)) == pdTRUE) {
-      snprintf(line, sizeof(line), "T:%d,H:%u,S:%u\n",
-               frame.temperature,
-               frame.humidity,
-               frame.soil);
-      Serial.print(line);
+      sendSensorToMainBoard(frame);
     }
 
     while (Serial.available() > 0) {
@@ -334,10 +431,24 @@ void TaskUART(void *pvParameters) {
 void TaskApiSync(void *pvParameters) {
   (void) pvParameters;
 
+  int8_t lastOverrideSent = 2;
+
   for (;;) {
     reconnectWifiIfNeeded();
-    pullConfigFromServer();
-    pushTelemetryToServer();
+    pullConfigFromSupabase();
+    pushTelemetryToSupabase();
+
+    ThresholdConfig snap;
+    portENTER_CRITICAL(&dataMux);
+    snap = config;
+    portEXIT_CRITICAL(&dataMux);
+
+    int8_t overrideMode = calcPumpOverride(snap);
+    if (overrideMode != lastOverrideSent) {
+      sendPumpOverrideToMainBoard(overrideMode);
+      lastOverrideSent = overrideMode;
+    }
+
     vTaskDelay(pdMS_TO_TICKS(API_PERIOD_MS));
   }
 }
@@ -370,6 +481,8 @@ void setup() {
   }
 
   connectWifi();
+  sendConfigToMainBoard();
+  sendPumpOverrideToMainBoard(calcPumpOverride(config));
 
   sensorQueue = xQueueCreate(1, sizeof(SensorFrame));
 

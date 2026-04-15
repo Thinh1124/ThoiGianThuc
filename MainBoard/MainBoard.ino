@@ -4,10 +4,10 @@
 #define RELAY_PIN 8
 #define LED_ERROR 13
 
-#define DRY_THRESHOLD 900
-#define WET_THRESHOLD 600
-#define SAFE_TEMP 32
-#define SAFETY_TIMEOUT 600000UL
+#define DEFAULT_DRY_THRESHOLD 900
+#define DEFAULT_WET_THRESHOLD 600
+#define DEFAULT_SAFE_TEMP 32
+#define DEFAULT_SAFETY_TIMEOUT 600000UL
 
 // ===== STATE =====
 typedef enum {
@@ -24,12 +24,54 @@ volatile int16_t soilValue = 0;
 volatile int8_t temperature = 0;
 volatile int8_t humidity = 0;
 
+// ===== CẤU HÌNH ĐỘNG TỪ ESP32 =====
+volatile uint16_t dryThreshold = DEFAULT_DRY_THRESHOLD;
+volatile uint16_t wetThreshold = DEFAULT_WET_THRESHOLD;
+volatile int8_t safeTemp = DEFAULT_SAFE_TEMP;
+volatile uint32_t safetyTimeoutMs = DEFAULT_SAFETY_TIMEOUT;
+volatile int8_t manualOverride = -1; // -1: auto, 0: force off, 1: force on
+
 volatile uint8_t pumpOn = 0;
 volatile uint32_t pumpStart = 0;
 
 // ===== BUFFER UART =====
-char buffer[32];
+char buffer[96];
 uint8_t idx = 0;
+
+bool parseConfigFrame(const char *line) {
+  uint16_t dry;
+  uint16_t wet;
+  unsigned long timeoutMs;
+  int safe;
+
+  if (sscanf(line, "CFG:dry=%hu,wet=%hu,timeout=%lu,safe=%d", &dry, &wet, &timeoutMs, &safe) != 4) {
+    return false;
+  }
+
+  if (dry > 1023 || wet > 1023 || dry <= wet) return false;
+  if (timeoutMs < 1000UL || timeoutMs > 3600000UL) return false;
+  if (safe < -20 || safe > 80) return false;
+
+  dryThreshold = dry;
+  wetThreshold = wet;
+  safetyTimeoutMs = timeoutMs;
+  safeTemp = (int8_t)safe;
+  return true;
+}
+
+bool parseManualFrame(const char *line) {
+  int v;
+  if (sscanf(line, "M:%d", &v) != 1) {
+    return false;
+  }
+
+  if (v != -1 && v != 0 && v != 1) {
+    return false;
+  }
+
+  manualOverride = (int8_t)v;
+  return true;
+}
 
 // ================= TASK UART =================
 void Task_UART(void *pvParameters) {
@@ -44,9 +86,18 @@ void Task_UART(void *pvParameters) {
 
         int t, h, s;
         if (sscanf(buffer, "T:%d,H:%d,S:%d", &t, &h, &s) == 3) {
-          temperature = t;
-          humidity = h;
-          soilValue = s;
+          if (t < -20) t = -20;
+          if (t > 80) t = 80;
+          if (h < 0) h = 0;
+          if (h > 100) h = 100;
+          if (s < 0) s = 0;
+          if (s > 1023) s = 1023;
+
+          temperature = (int8_t)t;
+          humidity = (int8_t)h;
+          soilValue = (int16_t)s;
+        } else if (!parseConfigFrame(buffer)) {
+          parseManualFrame(buffer);
         }
 
         idx = 0;
@@ -66,6 +117,9 @@ void Task_Control(void *pvParameters) {
   (void) pvParameters;
 
   for (;;) {
+    int8_t manual = manualOverride;
+    bool forceOn = (manual == 1);
+    bool forceOff = (manual == 0);
 
     switch (state) {
 
@@ -73,8 +127,12 @@ void Task_Control(void *pvParameters) {
         digitalWrite(RELAY_PIN, LOW);
         pumpOn = 0;
 
-        if (temperature > SAFE_TEMP) state = OVERHEAT;
-        else if (soilValue > DRY_THRESHOLD) {
+        if (temperature > safeTemp) state = OVERHEAT;
+        else if (forceOn) {
+          state = PUMPING;
+          pumpStart = millis();
+        }
+        else if (!forceOff && soilValue > dryThreshold) {
           state = PUMPING;
           pumpStart = millis();
         }
@@ -84,16 +142,26 @@ void Task_Control(void *pvParameters) {
         digitalWrite(RELAY_PIN, HIGH);
         pumpOn = 1;
 
-        if (temperature > SAFE_TEMP) state = OVERHEAT;
-        else if (soilValue < WET_THRESHOLD) state = IDLE;
-        else if ((millis() - pumpStart) > SAFETY_TIMEOUT) state = ERROR;
+        if (temperature > safeTemp) state = OVERHEAT;
+        else if ((millis() - pumpStart) > safetyTimeoutMs) state = ERROR;
+        else if (forceOn) {
+        }
+        else if (forceOff) state = IDLE;
+        else if (soilValue < wetThreshold) state = IDLE;
         break;
 
       case OVERHEAT:
         digitalWrite(RELAY_PIN, LOW);
         pumpOn = 0;
 
-        if (temperature <= SAFE_TEMP) state = IDLE;
+        if (temperature <= safeTemp) {
+          if (forceOn) {
+            state = PUMPING;
+            pumpStart = millis();
+          } else {
+            state = IDLE;
+          }
+        }
         break;
 
       case ERROR:
@@ -108,21 +176,25 @@ void Task_Control(void *pvParameters) {
   }
 }
 
-// ================= TASK MONITOR =================
-void Task_Monitor(void *pvParameters) {
+// ================= TASK FEEDBACK =================
+void Task_Feedback(void *pvParameters) {
   (void) pvParameters;
 
-  for (;;) {
-    Serial.print(F("T:"));
-    Serial.print(temperature);
-    Serial.print(F(" H:"));
-    Serial.print(humidity);
-    Serial.print(F(" S:"));
-    Serial.print(soilValue);
-    Serial.print(F(" P:"));
-    Serial.println(pumpOn);
+  uint8_t lastPumpState = 255;
+  uint32_t lastBeat = 0;
 
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
+  for (;;) {
+    uint8_t currentPump = pumpOn;
+    uint32_t now = millis();
+
+    if (currentPump != lastPumpState || (now - lastBeat) >= 1000UL) {
+      Serial.print(F("P:"));
+      Serial.println(currentPump);
+      lastPumpState = currentPump;
+      lastBeat = now;
+    }
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
@@ -135,7 +207,7 @@ void setup() {
 
   xTaskCreate(Task_UART, "UART", 100, NULL, 2, NULL);
   xTaskCreate(Task_Control, "CTRL", 100, NULL, 2, NULL);
-  xTaskCreate(Task_Monitor, "MON", 100, NULL, 1, NULL);
+  xTaskCreate(Task_Feedback, "FB", 100, NULL, 1, NULL);
 
   vTaskStartScheduler();
 }

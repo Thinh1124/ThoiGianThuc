@@ -40,7 +40,7 @@ const DEFAULT_CONFIG = {
   safe_temp: 32,
   timeout_ms: 600000,
   pump_mode: "threshold",
-  pump_status: 0,
+  pump_state: 0,
 };
 
 const DEFAULT_SCHEDULE_FORM = {
@@ -105,12 +105,21 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  const latestTelemetry = telemetry[telemetry.length - 1];
+  const latestTelemetry = useMemo(() => {
+    if (telemetry.length === 0) return null;
+
+    return telemetry.reduce((latest, item) => {
+      if (!latest) return item;
+      const latestTs = new Date(latest.created_at).getTime();
+      const itemTs = new Date(item.created_at).getTime();
+      return itemTs > latestTs ? item : latest;
+    }, null);
+  }, [telemetry]);
+  const telemetryPumpState =
+    latestTelemetry?.pump_state ?? latestTelemetry?.pump_status;
+  const configPumpState = config.pump_state ?? config.pump_status;
   const currentPumpStatus = normalizePumpStatus(
-    config.pump_status ??
-      config.pump_state ??
-      latestTelemetry?.pump_status ??
-      latestTelemetry?.pump_state,
+    telemetryPumpState ?? configPumpState,
   );
 
   const chartData = useMemo(
@@ -415,7 +424,9 @@ function App() {
                 <span className="text-sm text-slate-300">{stat.title}</span>
                 <Icon className={`h-5 w-5 ${stat.color}`} />
               </div>
-              <p className="mt-4 text-3xl font-bold text-white">{loading ? "..." : stat.value}</p>
+              <p className="mt-4 text-3xl font-bold text-white">
+                {loading ? "..." : stat.value}
+              </p>
             </article>
           );
         })}

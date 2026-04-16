@@ -31,7 +31,7 @@ const char* SUPABASE_URL = "https://jelbdikdlcsufgcneuri.supabase.co";
 const char* SUPABASE_API_KEY = "sb_publishable_ZPz5RRekgXhLQ2hARpOU1w_9U2nEt8v";
 
 const char* SUPABASE_TELEMETRY_PATH = "/rest/v1/telemetry";
-const char* SUPABASE_CONFIG_PATH = "/rest/v1/config?select=dry_threshold,wet_threshold,safe_temp,timeout_ms,pump_mode,pump_status&id=eq.1&limit=1";
+const char* SUPABASE_CONFIG_PATH = "/rest/v1/config?select=dry_threshold,wet_threshold,safe_temp,timeout_ms,pump_mode&id=eq.1&limit=1";
 const char* SUPABASE_SCHEDULES_PATH = "/rest/v1/schedules?select=start_time,duration_minutes,days_of_week,enabled&enabled=eq.true&order=start_time.asc";
 const char* SUPABASE_CONFIG_PATCH_PATH = "/rest/v1/config?id=eq.1";
 
@@ -44,6 +44,7 @@ const char* NTP_SERVER_2 = "time.nist.gov";
 // ===== TASK PERIOD =====
 static const uint32_t SENSOR_PERIOD_MS = 2000UL;
 static const uint32_t API_PERIOD_MS = 2000UL;
+static const uint32_t OVERRIDE_HEARTBEAT_MS = 4000UL;
 
 // ===== DATA STRUCT =====
 typedef struct {
@@ -452,7 +453,7 @@ void pushTelemetryToSupabase() {
 
   char payload[176];
   snprintf(payload, sizeof(payload),
-           "{\"temp\":%d,\"hum\":%u,\"soil\":%u,\"pump_status\":%u}",
+           "{\"temp\":%d,\"hum\":%u,\"soil\":%u,\"pump_state\":%u}",
            snap.temperature,
            snap.humidity,
            snap.soil,
@@ -465,8 +466,43 @@ void pushTelemetryToSupabase() {
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Prefer", "return=minimal");
-  http.POST((uint8_t*)payload, strlen(payload));
+  int code = http.POST((uint8_t*)payload, strlen(payload));
+  String errBody = (code < 200 || code >= 300) ? http.getString() : String();
   http.end();
+
+  if (code >= 200 && code < 300) return;
+
+  // Fallback for schema that uses pump_status instead of pump_state
+  HTTPClient fallback;
+  fallback.begin(url);
+  fallback.setTimeout(3000);
+  fallback.addHeader("apikey", SUPABASE_API_KEY);
+  fallback.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
+  fallback.addHeader("Content-Type", "application/json");
+  fallback.addHeader("Prefer", "return=minimal");
+
+  char fallbackPayload[176];
+  snprintf(fallbackPayload, sizeof(fallbackPayload),
+           "{\"temp\":%d,\"hum\":%u,\"soil\":%u,\"pump_status\":%u}",
+           snap.temperature,
+           snap.humidity,
+           snap.soil,
+           pump);
+
+  int fallbackCode = fallback.POST((uint8_t*)fallbackPayload, strlen(fallbackPayload));
+  String fallbackErr = (fallbackCode < 200 || fallbackCode >= 300) ? fallback.getString() : String();
+  fallback.end();
+
+  if (fallbackCode < 200 || fallbackCode >= 300) {
+    Serial.print("[telemetry] POST failed. code=");
+    Serial.print(code);
+    Serial.print(" body=");
+    Serial.print(errBody);
+    Serial.print(" | fallbackCode=");
+    Serial.print(fallbackCode);
+    Serial.print(" fallbackBody=");
+    Serial.println(fallbackErr);
+  }
 }
 
 void pullSchedulesFromSupabase() {
@@ -529,7 +565,7 @@ void pullSchedulesFromSupabase() {
   }
 }
 
-void syncRuntimeConfigToSupabase(const ThresholdConfig &cfg, const SensorFrame &snap, uint8_t pump) {
+void syncRuntimeConfigToSupabase(const SensorFrame &snap, uint8_t pump) {
   if (WiFi.status() != WL_CONNECTED) return;
 
   char url[192];
@@ -545,8 +581,7 @@ void syncRuntimeConfigToSupabase(const ThresholdConfig &cfg, const SensorFrame &
 
   char payload[256];
   snprintf(payload, sizeof(payload),
-           "{\"pump_mode\":\"%s\",\"pump_status\":%u,\"temp\":%d,\"hum\":%u,\"soil\":%u}",
-           cfg.pumpMode,
+           "{\"pump_state\":%u,\"temp\":%d,\"hum\":%u,\"soil\":%u}",
            pump,
            snap.temperature,
            snap.humidity,
@@ -565,14 +600,18 @@ void syncRuntimeConfigToSupabase(const ThresholdConfig &cfg, const SensorFrame &
   fallback.addHeader("Content-Type", "application/json");
   fallback.addHeader("Prefer", "return=minimal");
 
-  char fallbackPayload[96];
+  char fallbackPayload[256];
   snprintf(fallbackPayload, sizeof(fallbackPayload),
-           "{\"pump_mode\":\"%s\",\"pump_status\":%u}",
-           cfg.pumpMode,
-           pump);
+           "{\"pump_status\":%u,\"temp\":%d,\"hum\":%u,\"soil\":%u}",
+           pump,
+           snap.temperature,
+           snap.humidity,
+           snap.soil);
 
-  fallback.PATCH((uint8_t*)fallbackPayload, strlen(fallbackPayload));
+  int fallbackCode = fallback.PATCH((uint8_t*)fallbackPayload, strlen(fallbackPayload));
   fallback.end();
+
+  if (fallbackCode >= 200 && fallbackCode < 300) return;
 }
 
 void pullConfigFromSupabase() {
@@ -741,6 +780,7 @@ void TaskApiSync(void *pvParameters) {
   (void) pvParameters;
 
   int8_t lastOverrideSent = 2;
+  uint32_t lastOverrideSentAt = 0;
 
   for (;;) {
     reconnectWifiIfNeeded();
@@ -758,13 +798,16 @@ void TaskApiSync(void *pvParameters) {
     portEXIT_CRITICAL(&dataMux);
 
     int8_t overrideMode = calcPumpOverride(snap);
-    if (overrideMode != lastOverrideSent) {
+    uint32_t now = millis();
+    bool shouldResend = (now - lastOverrideSentAt) >= OVERRIDE_HEARTBEAT_MS;
+    if (overrideMode != lastOverrideSent || shouldResend) {
       sendPumpOverrideToMainBoard(overrideMode);
       lastOverrideSent = overrideMode;
+      lastOverrideSentAt = now;
     }
 
     pushTelemetryToSupabase();
-    syncRuntimeConfigToSupabase(snap, frame, pump);
+    syncRuntimeConfigToSupabase(frame, pump);
 
     vTaskDelay(pdMS_TO_TICKS(API_PERIOD_MS));
   }

@@ -42,7 +42,7 @@ volatile uint16_t dryThreshold = DEFAULT_DRY_THRESHOLD;
 volatile uint16_t wetThreshold = DEFAULT_WET_THRESHOLD;
 volatile int8_t safeTemp = DEFAULT_SAFE_TEMP;
 volatile uint32_t safetyTimeoutMs = DEFAULT_SAFETY_TIMEOUT;
-volatile int8_t manualOverride = -1; // -1: auto, 0: force off, 1: force on
+volatile int8_t modeOverride = -1; // -1: threshold, 0: force off, 1: force on
 
 volatile uint8_t pumpOn = 0;
 volatile uint32_t pumpStart = 0;
@@ -72,7 +72,7 @@ bool parseConfigFrame(const char *line) {
   return true;
 }
 
-bool parseManualFrame(const char *line) {
+bool parseOverrideFrame(const char *line) {
   int v;
   if (sscanf(line, "M:%d", &v) != 1) {
     return false;
@@ -82,7 +82,7 @@ bool parseManualFrame(const char *line) {
     return false;
   }
 
-  manualOverride = (int8_t)v;
+  modeOverride = (int8_t)v;
   return true;
 }
 
@@ -110,7 +110,7 @@ void Task_UART(void *pvParameters) {
           humidity = (int8_t)h;
           soilValue = (int16_t)s;
         } else if (!parseConfigFrame(buffer)) {
-          parseManualFrame(buffer);
+          parseOverrideFrame(buffer);
         }
 
         idx = 0;
@@ -132,9 +132,9 @@ void Task_Control(void *pvParameters) {
   (void) pvParameters;
 
   for (;;) {
-    int8_t manual = manualOverride;
-    bool forceOn = (manual == 1);
-    bool forceOff = (manual == 0);
+    int8_t overrideMode = modeOverride;
+    bool forceOn = (overrideMode == 1);
+    bool forceOff = (overrideMode == 0);
 
     switch (state) {
 

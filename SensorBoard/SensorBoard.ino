@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <math.h>
+#include <time.h>
 
 // ===== OLED =====
 #define SCREEN_WIDTH 128
@@ -30,7 +31,15 @@ const char* SUPABASE_URL = "https://jelbdikdlcsufgcneuri.supabase.co";
 const char* SUPABASE_API_KEY = "sb_publishable_ZPz5RRekgXhLQ2hARpOU1w_9U2nEt8v";
 
 const char* SUPABASE_TELEMETRY_PATH = "/rest/v1/telemetry";
-const char* SUPABASE_CONFIG_PATH = "/rest/v1/config?select=dry_threshold,wet_threshold,safe_temp,timeout_ms,pump_mode,manual_trigger&id=eq.1&limit=1";
+const char* SUPABASE_CONFIG_PATH = "/rest/v1/config?select=dry_threshold,wet_threshold,safe_temp,timeout_ms,pump_mode,pump_status&id=eq.1&limit=1";
+const char* SUPABASE_SCHEDULES_PATH = "/rest/v1/schedules?select=start_time,duration_minutes,days_of_week,enabled&enabled=eq.true&order=start_time.asc";
+const char* SUPABASE_CONFIG_PATCH_PATH = "/rest/v1/config?id=eq.1";
+
+// ===== TIME =====
+static const long TZ_OFFSET_SEC = 7 * 3600L;
+static const int DST_OFFSET_SEC = 0;
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.nist.gov";
 
 // ===== TASK PERIOD =====
 static const uint32_t SENSOR_PERIOD_MS = 2000UL;
@@ -50,8 +59,14 @@ typedef struct {
   uint32_t timeoutMs;
   int8_t safeTemp;
   char pumpMode[12];
-  bool manualTrigger;
 } ThresholdConfig;
+
+typedef struct {
+  uint16_t startMinute;
+  uint16_t durationMinutes;
+  uint8_t daysMask;
+  bool enabled;
+} ScheduleEntry;
 
 DHT dht(DHTPIN, DHTTYPE);
 bool oledAvailable = false;
@@ -60,8 +75,12 @@ QueueHandle_t sensorQueue = NULL;
 portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
 
 volatile SensorFrame latestFrame = {0, 0, 0, 0};
-volatile ThresholdConfig config = {900, 600, 600000UL, 32, "threshold", false};
+volatile ThresholdConfig config = {900, 600, 600000UL, 32, "threshold"};
 volatile uint8_t pumpState = 0;
+static const uint8_t MAX_SCHEDULES = 20;
+volatile ScheduleEntry schedules[MAX_SCHEDULES];
+volatile uint8_t scheduleCount = 0;
+volatile bool clockSynced = false;
 
 #define MAIN_SERIAL Serial2
 
@@ -81,6 +100,18 @@ static void updateLatestFrame(const SensorFrame &src) {
   portENTER_CRITICAL(&dataMux);
   memcpy((void *)&latestFrame, &src, sizeof(SensorFrame));
   portEXIT_CRITICAL(&dataMux);
+}
+
+static uint8_t snapshotSchedules(ScheduleEntry *dst, uint8_t maxItems) {
+  if (dst == NULL || maxItems == 0) return 0;
+
+  uint8_t count;
+  portENTER_CRITICAL(&dataMux);
+  count = scheduleCount;
+  if (count > maxItems) count = maxItems;
+  memcpy(dst, (const void *)schedules, sizeof(ScheduleEntry) * count);
+  portEXIT_CRITICAL(&dataMux);
+  return count;
 }
 
 static bool extractJsonInt(const String &body, const char *key, long &out) {
@@ -171,6 +202,162 @@ static bool extractJsonBool(const String &body, const char *key, bool &out) {
   return false;
 }
 
+static bool extractJsonIntArray(const String &body, const char *key, uint8_t *out, size_t maxItems, size_t &outCount) {
+  outCount = 0;
+  if (out == NULL || maxItems == 0) return false;
+
+  String token = "\"";
+  token += key;
+  token += "\"";
+
+  int p = body.indexOf(token);
+  if (p < 0) return false;
+
+  p = body.indexOf(':', p);
+  if (p < 0) return false;
+  p++;
+
+  while (p < body.length() && (body[p] == ' ' || body[p] == '\t')) p++;
+  if (p >= body.length() || body[p] != '[') return false;
+  p++;
+
+  while (p < body.length()) {
+    while (p < body.length() && (body[p] == ' ' || body[p] == '\t' || body[p] == ',')) p++;
+
+    if (p >= body.length()) break;
+    if (body[p] == ']') {
+      return true;
+    }
+
+    int sign = 1;
+    if (body[p] == '-') {
+      sign = -1;
+      p++;
+    }
+
+    if (p >= body.length() || body[p] < '0' || body[p] > '9') return false;
+
+    long v = 0;
+    while (p < body.length() && body[p] >= '0' && body[p] <= '9') {
+      v = v * 10 + (body[p] - '0');
+      p++;
+    }
+    v *= sign;
+
+    if (outCount < maxItems) {
+      out[outCount++] = (uint8_t)v;
+    }
+
+    while (p < body.length() && (body[p] == ' ' || body[p] == '\t')) p++;
+    if (p < body.length() && body[p] == ']') {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool parseTimeToMinute(const String &value, uint16_t &minuteOfDay) {
+  if (value.length() < 5) return false;
+
+  int hh = value.substring(0, 2).toInt();
+  int mm = value.substring(3, 5).toInt();
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return false;
+
+  minuteOfDay = (uint16_t)(hh * 60 + mm);
+  return true;
+}
+
+static bool parseScheduleObject(const String &obj, ScheduleEntry &entry) {
+  char startBuf[12];
+  startBuf[0] = '\0';
+
+  long duration;
+  bool enabledVal = true;
+  uint8_t days[7];
+  size_t dayCount = 0;
+
+  if (!extractJsonText(obj, "start_time", startBuf, sizeof(startBuf))) return false;
+  if (!extractJsonInt(obj, "duration_minutes", duration)) return false;
+  if (duration < 1 || duration > 1440) return false;
+
+  extractJsonBool(obj, "enabled", enabledVal);
+  if (!extractJsonIntArray(obj, "days_of_week", days, 7, dayCount)) return false;
+
+  uint16_t startMinute;
+  if (!parseTimeToMinute(String(startBuf), startMinute)) return false;
+
+  uint8_t mask = 0;
+  for (size_t i = 0; i < dayCount; i++) {
+    uint8_t day = days[i];
+    if (day >= 1 && day <= 7) {
+      mask |= (uint8_t)(1U << (day - 1));
+    }
+  }
+
+  if (mask == 0) return false;
+
+  entry.startMinute = startMinute;
+  entry.durationMinutes = (uint16_t)duration;
+  entry.daysMask = mask;
+  entry.enabled = enabledVal;
+  return true;
+}
+
+static bool syncClockIfNeeded(bool forceConfig) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  if (!clockSynced || forceConfig) {
+    configTime(TZ_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
+  }
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 1000)) {
+    clockSynced = true;
+    return true;
+  }
+
+  return false;
+}
+
+static bool isScheduleActiveNow() {
+  ScheduleEntry local[MAX_SCHEDULES];
+  uint8_t count = snapshotSchedules(local, MAX_SCHEDULES);
+  if (count == 0) return false;
+
+  struct tm nowTime;
+  if (!getLocalTime(&nowTime, 100)) return false;
+
+  uint8_t day = (nowTime.tm_wday == 0) ? 1 : (uint8_t)(nowTime.tm_wday + 1);
+  uint8_t prevDay = (day == 1) ? 7 : (uint8_t)(day - 1);
+  uint16_t minuteOfDay = (uint16_t)(nowTime.tm_hour * 60 + nowTime.tm_min);
+
+  for (uint8_t i = 0; i < count; i++) {
+    const ScheduleEntry &sch = local[i];
+    if (!sch.enabled) continue;
+    if (sch.durationMinutes == 0) continue;
+
+    uint16_t start = sch.startMinute;
+    uint16_t end = (uint16_t)((start + sch.durationMinutes) % 1440);
+    bool wraps = (start + sch.durationMinutes) >= 1440;
+
+    if (!wraps) {
+      bool dayMatch = (sch.daysMask & (uint8_t)(1U << (day - 1))) != 0;
+      if (dayMatch && minuteOfDay >= start && minuteOfDay < end) return true;
+    } else {
+      if (minuteOfDay >= start) {
+        bool dayMatch = (sch.daysMask & (uint8_t)(1U << (day - 1))) != 0;
+        if (dayMatch) return true;
+      } else if (minuteOfDay < end) {
+        bool prevDayMatch = (sch.daysMask & (uint8_t)(1U << (prevDay - 1))) != 0;
+        if (prevDayMatch) return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 static void parseMainFeedbackLine(char *line) {
   char *p = strstr(line, "P:");
   if (p == NULL) return;
@@ -213,8 +400,8 @@ void sendPumpOverrideToMainBoard(int8_t overrideMode) {
 }
 
 int8_t calcPumpOverride(const ThresholdConfig &cfg) {
-  if (strcmp(cfg.pumpMode, "manual") == 0 || strcmp(cfg.pumpMode, "schedule") == 0) {
-    return cfg.manualTrigger ? 1 : 0;
+  if (strcmp(cfg.pumpMode, "schedule") == 0) {
+    return isScheduleActiveNow() ? 1 : 0;
   }
   return -1;
 }
@@ -227,6 +414,10 @@ void connectWifi() {
   while (WiFi.status() != WL_CONNECTED && (millis() - start) < 15000UL) {
     delay(200);
   }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    syncClockIfNeeded(true);
+  }
 }
 
 void reconnectWifiIfNeeded() {
@@ -238,6 +429,10 @@ void reconnectWifiIfNeeded() {
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - start) < 5000UL) {
     vTaskDelay(pdMS_TO_TICKS(200));
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    syncClockIfNeeded(false);
   }
 }
 
@@ -255,9 +450,9 @@ void pushTelemetryToSupabase() {
   char url[192];
   snprintf(url, sizeof(url), "%s%s", SUPABASE_URL, SUPABASE_TELEMETRY_PATH);
 
-  char payload[160];
+  char payload[176];
   snprintf(payload, sizeof(payload),
-           "{\"temp\":%d,\"hum\":%u,\"soil\":%u,\"pump_state\":%u}",
+           "{\"temp\":%d,\"hum\":%u,\"soil\":%u,\"pump_status\":%u}",
            snap.temperature,
            snap.humidity,
            snap.soil,
@@ -272,6 +467,112 @@ void pushTelemetryToSupabase() {
   http.addHeader("Prefer", "return=minimal");
   http.POST((uint8_t*)payload, strlen(payload));
   http.end();
+}
+
+void pullSchedulesFromSupabase() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  char url[256];
+  snprintf(url, sizeof(url), "%s%s", SUPABASE_URL, SUPABASE_SCHEDULES_PATH);
+
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(3000);
+  http.addHeader("apikey", SUPABASE_API_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
+  http.addHeader("Accept", "application/json");
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  ScheduleEntry nextList[MAX_SCHEDULES];
+  uint8_t nextCount = 0;
+
+  int seek = 0;
+  while (seek < body.length() && nextCount < MAX_SCHEDULES) {
+    int startObj = body.indexOf('{', seek);
+    if (startObj < 0) break;
+    int endObj = body.indexOf('}', startObj);
+    if (endObj < 0) break;
+
+    String obj = body.substring(startObj, endObj + 1);
+    ScheduleEntry entry;
+    if (parseScheduleObject(obj, entry)) {
+      nextList[nextCount++] = entry;
+    }
+
+    seek = endObj + 1;
+  }
+
+  bool changed = false;
+  ScheduleEntry curList[MAX_SCHEDULES];
+  uint8_t curCount = snapshotSchedules(curList, MAX_SCHEDULES);
+
+  if (curCount != nextCount) {
+    changed = true;
+  } else if (nextCount > 0) {
+    changed = (memcmp(curList, nextList, sizeof(ScheduleEntry) * nextCount) != 0);
+  }
+
+  if (changed) {
+    portENTER_CRITICAL(&dataMux);
+    scheduleCount = nextCount;
+    if (nextCount > 0) {
+      memcpy((void *)schedules, nextList, sizeof(ScheduleEntry) * nextCount);
+    }
+    portEXIT_CRITICAL(&dataMux);
+  }
+}
+
+void syncRuntimeConfigToSupabase(const ThresholdConfig &cfg, const SensorFrame &snap, uint8_t pump) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  char url[192];
+  snprintf(url, sizeof(url), "%s%s", SUPABASE_URL, SUPABASE_CONFIG_PATCH_PATH);
+
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(3000);
+  http.addHeader("apikey", SUPABASE_API_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Prefer", "return=minimal");
+
+  char payload[256];
+  snprintf(payload, sizeof(payload),
+           "{\"pump_mode\":\"%s\",\"pump_status\":%u,\"temp\":%d,\"hum\":%u,\"soil\":%u}",
+           cfg.pumpMode,
+           pump,
+           snap.temperature,
+           snap.humidity,
+           snap.soil);
+
+  int code = http.PATCH((uint8_t*)payload, strlen(payload));
+  http.end();
+
+  if (code >= 200 && code < 300) return;
+
+  HTTPClient fallback;
+  fallback.begin(url);
+  fallback.setTimeout(3000);
+  fallback.addHeader("apikey", SUPABASE_API_KEY);
+  fallback.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
+  fallback.addHeader("Content-Type", "application/json");
+  fallback.addHeader("Prefer", "return=minimal");
+
+  char fallbackPayload[96];
+  snprintf(fallbackPayload, sizeof(fallbackPayload),
+           "{\"pump_mode\":\"%s\",\"pump_status\":%u}",
+           cfg.pumpMode,
+           pump);
+
+  fallback.PATCH((uint8_t*)fallbackPayload, strlen(fallbackPayload));
+  fallback.end();
 }
 
 void pullConfigFromSupabase() {
@@ -299,7 +600,6 @@ void pullConfigFromSupabase() {
   long v;
   char modeBuf[12];
   modeBuf[0] = '\0';
-  bool manualVal = false;
   ThresholdConfig nextCfg;
   snapshotConfig(nextCfg);
 
@@ -332,18 +632,13 @@ void pullConfigFromSupabase() {
   }
 
   if (extractJsonText(body, "pump_mode", modeBuf, sizeof(modeBuf))) {
-    if (strcmp(modeBuf, "threshold") == 0 || strcmp(modeBuf, "schedule") == 0 || strcmp(modeBuf, "manual") == 0) {
+    if (strcmp(modeBuf, "threshold") == 0 || strcmp(modeBuf, "schedule") == 0) {
       if (strcmp(nextCfg.pumpMode, modeBuf) != 0) {
         strncpy(nextCfg.pumpMode, modeBuf, sizeof(nextCfg.pumpMode) - 1);
         nextCfg.pumpMode[sizeof(nextCfg.pumpMode) - 1] = '\0';
         changed = true;
       }
     }
-  }
-
-  if (extractJsonBool(body, "manual_trigger", manualVal) && nextCfg.manualTrigger != manualVal) {
-    nextCfg.manualTrigger = manualVal;
-    changed = true;
   }
 
   if (changed) {
@@ -449,17 +744,27 @@ void TaskApiSync(void *pvParameters) {
 
   for (;;) {
     reconnectWifiIfNeeded();
+    syncClockIfNeeded(false);
     pullConfigFromSupabase();
-    pushTelemetryToSupabase();
+    pullSchedulesFromSupabase();
 
     ThresholdConfig snap;
+    SensorFrame frame;
+    uint8_t pump;
     snapshotConfig(snap);
+    snapshotLatestFrame(frame);
+    portENTER_CRITICAL(&dataMux);
+    pump = pumpState;
+    portEXIT_CRITICAL(&dataMux);
 
     int8_t overrideMode = calcPumpOverride(snap);
     if (overrideMode != lastOverrideSent) {
       sendPumpOverrideToMainBoard(overrideMode);
       lastOverrideSent = overrideMode;
     }
+
+    pushTelemetryToSupabase();
+    syncRuntimeConfigToSupabase(snap, frame, pump);
 
     vTaskDelay(pdMS_TO_TICKS(API_PERIOD_MS));
   }

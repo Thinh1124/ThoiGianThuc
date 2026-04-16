@@ -24,13 +24,13 @@ import { supabase } from "./lib/supabase";
 
 const MODE_OPTIONS = ["threshold", "schedule"];
 const DAY_OPTIONS = [
-  { label: "CN", value: 1 },
-  { label: "T2", value: 2 },
-  { label: "T3", value: 3 },
-  { label: "T4", value: 4 },
-  { label: "T5", value: 5 },
-  { label: "T6", value: 6 },
-  { label: "T7", value: 7 },
+  { label: "Sun", value: 1 },
+  { label: "Mon", value: 2 },
+  { label: "Tue", value: 3 },
+  { label: "Wed", value: 4 },
+  { label: "Thu", value: 5 },
+  { label: "Fri", value: 6 },
+  { label: "Sat", value: 7 },
 ];
 
 const DEFAULT_CONFIG = {
@@ -89,6 +89,11 @@ function formatTimeLabel(raw) {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+function formatDayList(dayList = []) {
+  const map = new Map(DAY_OPTIONS.map((day) => [day.value, day.label]));
+  return dayList.map((day) => map.get(day) || String(day)).join(", ");
+}
+
 function App() {
   const [telemetry, setTelemetry] = useState([]);
   const [config, setConfig] = useState(DEFAULT_CONFIG);
@@ -102,7 +107,10 @@ function App() {
 
   const latestTelemetry = telemetry[telemetry.length - 1];
   const currentPumpStatus = normalizePumpStatus(
-    config.pump_status ?? latestTelemetry?.pump_status,
+    config.pump_status ??
+      config.pump_state ??
+      latestTelemetry?.pump_status ??
+      latestTelemetry?.pump_state,
   );
 
   const chartData = useMemo(
@@ -118,19 +126,19 @@ function App() {
 
   const stats = [
     {
-      title: "Nhiệt độ",
+      title: "Temperature",
       value: `${toFloat(latestTelemetry?.temp).toFixed(1)}°C`,
       icon: Thermometer,
       color: "text-orange-300",
     },
     {
-      title: "Độ ẩm không khí",
+      title: "Air humidity",
       value: `${toFloat(latestTelemetry?.hum).toFixed(1)}%`,
       icon: Droplets,
       color: "text-sky-300",
     },
     {
-      title: "Độ ẩm đất",
+      title: "Soil moisture",
       value: `${toFloat(latestTelemetry?.soil).toFixed(1)}%`,
       icon: Leaf,
       color: "text-lime-300",
@@ -138,6 +146,14 @@ function App() {
   ];
 
   useEffect(() => {
+    const fetchSchedules = async () => {
+      const { data } = await supabase
+        .from("schedules")
+        .select("*")
+        .order("start_time", { ascending: true });
+      if (data) setSchedules(data);
+    };
+
     const bootstrap = async () => {
       setLoading(true);
       setError("");
@@ -164,7 +180,7 @@ function App() {
           telemetryError?.message ||
             configError?.message ||
             scheduleError?.message ||
-            "Không thể tải dữ liệu",
+            "Failed to load dashboard data",
         );
       }
 
@@ -176,7 +192,6 @@ function App() {
         const merged = {
           ...DEFAULT_CONFIG,
           ...configRow,
-          pump_status: normalizePumpStatus(configRow.pump_status),
         };
         setConfig(merged);
         setConfigForm(merged);
@@ -201,9 +216,7 @@ function App() {
         }
       }
 
-      if (scheduleRows) {
-        setSchedules(scheduleRows);
-      }
+      if (scheduleRows) setSchedules(scheduleRows);
 
       setLoading(false);
     };
@@ -233,7 +246,6 @@ function App() {
           const next = {
             ...DEFAULT_CONFIG,
             ...payload.new,
-            pump_status: normalizePumpStatus(payload.new?.pump_status),
           };
           setConfig(next);
           setConfigForm(next);
@@ -246,13 +258,7 @@ function App() {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "schedules" },
-        async () => {
-          const { data } = await supabase
-            .from("schedules")
-            .select("*")
-            .order("start_time", { ascending: true });
-          if (data) setSchedules(data);
-        },
+        fetchSchedules,
       )
       .subscribe();
 
@@ -270,6 +276,10 @@ function App() {
       .from("config")
       .upsert({ id: 1, pump_mode: mode }, { onConflict: "id" });
     if (updateError) setError(updateError.message);
+    else {
+      setConfig((prev) => ({ ...prev, pump_mode: mode }));
+      setConfigForm((prev) => ({ ...prev, pump_mode: mode }));
+    }
     setBusy(false);
   };
 
@@ -293,6 +303,10 @@ function App() {
       .from("config")
       .upsert({ id: 1, ...payload }, { onConflict: "id" });
     if (updateError) setError(updateError.message);
+    else {
+      setConfig((prev) => ({ ...prev, ...payload }));
+      setConfigForm((prev) => ({ ...prev, ...payload }));
+    }
     setBusy(false);
   };
 
@@ -335,6 +349,11 @@ function App() {
     if (scheduleError) {
       setError(scheduleError.message);
     } else {
+      const { data } = await supabase
+        .from("schedules")
+        .select("*")
+        .order("start_time", { ascending: true });
+      if (data) setSchedules(data);
       resetScheduleForm();
     }
     setBusy(false);
@@ -358,6 +377,13 @@ function App() {
       .delete()
       .eq("id", id);
     if (deleteError) setError(deleteError.message);
+    else {
+      const { data } = await supabase
+        .from("schedules")
+        .select("*")
+        .order("start_time", { ascending: true });
+      if (data) setSchedules(data);
+    }
     if (editingId === id) resetScheduleForm();
     setBusy(false);
   };
@@ -367,7 +393,7 @@ function App() {
       <header className="mb-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4 sm:p-6">
         <h1 className="text-2xl font-bold text-white">IrriFlow Dashboard</h1>
         <p className="mt-2 text-sm text-slate-300">
-          Giám sát và điều khiển hệ thống tưới thời gian thực.
+          Real-time irrigation monitoring and control.
         </p>
       </header>
 
@@ -389,9 +415,7 @@ function App() {
                 <span className="text-sm text-slate-300">{stat.title}</span>
                 <Icon className={`h-5 w-5 ${stat.color}`} />
               </div>
-              <p className="mt-4 text-3xl font-bold text-white">
-                {loading ? "..." : stat.value}
-              </p>
+              <p className="mt-4 text-3xl font-bold text-white">{loading ? "..." : stat.value}</p>
             </article>
           );
         })}
@@ -419,7 +443,7 @@ function App() {
           <div className="mb-4 flex items-center gap-2">
             <Activity className="h-5 w-5 text-cyan-300" />
             <h2 className="text-sm font-semibold text-slate-200">
-              Telemetry (20 điểm gần nhất)
+              Telemetry (latest 20 points)
             </h2>
           </div>
           <div className="h-60 w-full">
@@ -440,7 +464,7 @@ function App() {
                 <Line
                   type="monotone"
                   dataKey="temp"
-                  name="Nhiệt độ"
+                  name="Temperature"
                   stroke="#fb923c"
                   strokeWidth={2}
                   dot={false}
@@ -448,7 +472,7 @@ function App() {
                 <Line
                   type="monotone"
                   dataKey="hum"
-                  name="Ẩm KK"
+                  name="Humidity"
                   stroke="#38bdf8"
                   strokeWidth={2}
                   dot={false}
@@ -456,7 +480,7 @@ function App() {
                 <Line
                   type="monotone"
                   dataKey="soil"
-                  name="Ẩm đất"
+                  name="Soil"
                   stroke="#a3e635"
                   strokeWidth={2}
                   dot={false}
@@ -552,7 +576,7 @@ function App() {
               disabled={busy}
               className="col-span-2 mt-1 inline-flex items-center justify-center gap-2 rounded-lg bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              <Save className="h-4 w-4" /> Lưu cấu hình
+              <Save className="h-4 w-4" /> Save configuration
             </button>
           </form>
         </article>
@@ -580,7 +604,7 @@ function App() {
                 />
               </label>
               <label className="text-xs text-slate-400">
-                Duration (phút)
+                Duration (minutes)
                 <input
                   type="number"
                   min="1"
@@ -641,7 +665,7 @@ function App() {
                 ) : (
                   <Plus className="h-4 w-4" />
                 )}
-                {editingId ? "Cập nhật lịch" : "Thêm lịch"}
+                {editingId ? "Update schedule" : "Add schedule"}
               </button>
               {editingId && (
                 <button
@@ -649,7 +673,7 @@ function App() {
                   onClick={resetScheduleForm}
                   className="rounded-lg bg-slate-700 px-4 py-2 text-sm font-semibold text-slate-100 hover:bg-slate-600"
                 >
-                  Hủy
+                  Cancel
                 </button>
               )}
             </div>
@@ -657,7 +681,7 @@ function App() {
 
           <div className="mt-4 space-y-2">
             {schedules.length === 0 && (
-              <p className="text-xs text-slate-500">Chưa có lịch nào.</p>
+              <p className="text-xs text-slate-500">No schedules yet.</p>
             )}
             {schedules.map((schedule) => (
               <div
@@ -667,7 +691,7 @@ function App() {
                 <div className="flex items-center justify-between">
                   <p className="text-sm font-semibold text-white">
                     {String(schedule.start_time).slice(0, 5)} ·{" "}
-                    {schedule.duration_minutes} phút
+                    {schedule.duration_minutes} min
                   </p>
                   <span
                     className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${
@@ -680,7 +704,7 @@ function App() {
                   </span>
                 </div>
                 <p className="mt-1 text-xs text-slate-400">
-                  Ngày: {(schedule.days_of_week ?? []).join(", ") || "-"}
+                  Days: {formatDayList(schedule.days_of_week ?? []) || "-"}
                 </p>
                 <div className="mt-3 flex gap-2">
                   <button
@@ -688,14 +712,14 @@ function App() {
                     onClick={() => onEditSchedule(schedule)}
                     className="inline-flex items-center gap-1 rounded-md bg-slate-800 px-2 py-1 text-xs text-slate-200 hover:bg-slate-700"
                   >
-                    <Pencil className="h-3.5 w-3.5" /> Sửa
+                    <Pencil className="h-3.5 w-3.5" /> Edit
                   </button>
                   <button
                     type="button"
                     onClick={() => onDeleteSchedule(schedule.id)}
                     className="inline-flex items-center gap-1 rounded-md bg-rose-600/80 px-2 py-1 text-xs text-rose-50 hover:bg-rose-600"
                   >
-                    <Trash2 className="h-3.5 w-3.5" /> Xóa
+                    <Trash2 className="h-3.5 w-3.5" /> Delete
                   </button>
                 </div>
               </div>

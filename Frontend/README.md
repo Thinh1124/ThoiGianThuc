@@ -18,6 +18,7 @@ npm run dev
 ## Features
 
 - Real-time telemetry monitor via Supabase Realtime.
-- Config sync and pump mode control.
-- Manual trigger + threshold config update.
+- Config sync and pump mode control (`threshold` and `schedule`).
+- Real-time schedule override for pump on/off control.
+- Threshold configuration update.
 - Schedule CRUD for fixed watering windows.

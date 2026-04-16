@@ -4,6 +4,7 @@
 #include <DHT.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <math.h>
 
 // ===== OLED =====
 #define SCREEN_WIDTH 128
@@ -17,6 +18,8 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // ===== UART TO MAIN BOARD =====
 #define UART_BAUD 9600
+#define UART2_TX_PIN 17
+#define UART2_RX_PIN 16
 
 // ===== WIFI =====
 const char* WIFI_SSID = "baitaplon";
@@ -31,7 +34,6 @@ const char* SUPABASE_CONFIG_PATH = "/rest/v1/config?select=dry_threshold,wet_thr
 
 // ===== TASK PERIOD =====
 static const uint32_t SENSOR_PERIOD_MS = 2000UL;
-static const uint32_t RUNTIME_PERIOD_MS = 1000UL;
 static const uint32_t API_PERIOD_MS = 2000UL;
 
 // ===== DATA STRUCT =====
@@ -59,20 +61,26 @@ portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
 
 volatile SensorFrame latestFrame = {0, 0, 0, 0};
 volatile ThresholdConfig config = {900, 600, 600000UL, 32, "threshold", false};
-volatile uint32_t runtimeSec = 0;
 volatile uint8_t pumpState = 0;
-volatile uint32_t mainLastSeenMs = 0;
 
-static void copySensorFrameFromVolatile(SensorFrame &dst, const volatile SensorFrame &src) {
-  memcpy(&dst, (const void *)&src, sizeof(SensorFrame));
+#define MAIN_SERIAL Serial2
+
+static void snapshotConfig(ThresholdConfig &dst) {
+  portENTER_CRITICAL(&dataMux);
+  memcpy(&dst, (const void *)&config, sizeof(ThresholdConfig));
+  portEXIT_CRITICAL(&dataMux);
 }
 
-static void copyThresholdConfigFromVolatile(ThresholdConfig &dst, const volatile ThresholdConfig &src) {
-  memcpy(&dst, (const void *)&src, sizeof(ThresholdConfig));
+static void snapshotLatestFrame(SensorFrame &dst) {
+  portENTER_CRITICAL(&dataMux);
+  memcpy(&dst, (const void *)&latestFrame, sizeof(SensorFrame));
+  portEXIT_CRITICAL(&dataMux);
 }
 
-static void writeSensorFrameToVolatile(volatile SensorFrame &dst, const SensorFrame &src) {
-  memcpy((void *)&dst, &src, sizeof(SensorFrame));
+static void updateLatestFrame(const SensorFrame &src) {
+  portENTER_CRITICAL(&dataMux);
+  memcpy((void *)&latestFrame, &src, sizeof(SensorFrame));
+  portEXIT_CRITICAL(&dataMux);
 }
 
 static bool extractJsonInt(const String &body, const char *key, long &out) {
@@ -171,17 +179,13 @@ static void parseMainFeedbackLine(char *line) {
   if (*p == '0' || *p == '1') {
     portENTER_CRITICAL(&dataMux);
     pumpState = (uint8_t)(*p - '0');
-    mainLastSeenMs = millis();
     portEXIT_CRITICAL(&dataMux);
   }
 }
 
 void sendConfigToMainBoard() {
   ThresholdConfig snap;
-
-  portENTER_CRITICAL(&dataMux);
-  copyThresholdConfigFromVolatile(snap, config);
-  portEXIT_CRITICAL(&dataMux);
+  snapshotConfig(snap);
 
   char line[96];
   snprintf(line, sizeof(line), "CFG:dry=%u,wet=%u,timeout=%lu,safe=%d\n",
@@ -190,7 +194,7 @@ void sendConfigToMainBoard() {
            (unsigned long)snap.timeoutMs,
            snap.safeTemp);
 
-  Serial.print(line);
+  MAIN_SERIAL.print(line);
 }
 
 void sendSensorToMainBoard(const SensorFrame &frame) {
@@ -199,13 +203,13 @@ void sendSensorToMainBoard(const SensorFrame &frame) {
            frame.temperature,
            frame.humidity,
            frame.soil);
-  Serial.print(line);
+  MAIN_SERIAL.print(line);
 }
 
 void sendPumpOverrideToMainBoard(int8_t overrideMode) {
   char line[12];
   snprintf(line, sizeof(line), "M:%d\n", overrideMode);
-  Serial.print(line);
+  MAIN_SERIAL.print(line);
 }
 
 int8_t calcPumpOverride(const ThresholdConfig &cfg) {
@@ -241,19 +245,11 @@ void pushTelemetryToSupabase() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   SensorFrame snap;
-  ThresholdConfig cfg;
-  uint32_t rt;
   uint8_t pump;
-  uint8_t mainOnline = 0;
+  snapshotLatestFrame(snap);
 
   portENTER_CRITICAL(&dataMux);
-  copySensorFrameFromVolatile(snap, latestFrame);
-  copyThresholdConfigFromVolatile(cfg, config);
-  rt = runtimeSec;
   pump = pumpState;
-  if (mainLastSeenMs > 0 && (millis() - mainLastSeenMs) < 10000UL) {
-    mainOnline = 1;
-  }
   portEXIT_CRITICAL(&dataMux);
 
   char url[192];
@@ -261,7 +257,7 @@ void pushTelemetryToSupabase() {
 
   char payload[160];
   snprintf(payload, sizeof(payload),
-           "{\"temp\":%d,\"hum\":%u,\"soil\":%u,\"pump_status\":%u}",
+           "{\"temp\":%d,\"hum\":%u,\"soil\":%u,\"pump_state\":%u}",
            snap.temperature,
            snap.humidity,
            snap.soil,
@@ -269,6 +265,7 @@ void pushTelemetryToSupabase() {
 
   HTTPClient http;
   http.begin(url);
+  http.setTimeout(3000);
   http.addHeader("apikey", SUPABASE_API_KEY);
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
   http.addHeader("Content-Type", "application/json");
@@ -285,6 +282,7 @@ void pullConfigFromSupabase() {
 
   HTTPClient http;
   http.begin(url);
+  http.setTimeout(3000);
   http.addHeader("apikey", SUPABASE_API_KEY);
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
   http.addHeader("Accept", "application/json");
@@ -301,54 +299,58 @@ void pullConfigFromSupabase() {
   long v;
   char modeBuf[12];
   modeBuf[0] = '\0';
-  bool manualVal;
-  bool hasManualVal = false;
+  bool manualVal = false;
+  ThresholdConfig nextCfg;
+  snapshotConfig(nextCfg);
 
-  portENTER_CRITICAL(&dataMux);
-  if (extractJsonInt(body, "dry_threshold", v)) {
-    if (v >= 0 && v <= 1023 && config.dry != (uint16_t)v) {
-      config.dry = (uint16_t)v;
+  if (extractJsonInt(body, "dry_threshold", v) && v >= 0 && v <= 1023) {
+    if (nextCfg.dry != (uint16_t)v) {
+      nextCfg.dry = (uint16_t)v;
       changed = true;
     }
   }
 
-  if (extractJsonInt(body, "wet_threshold", v)) {
-    if (v >= 0 && v <= 1023 && config.wet != (uint16_t)v) {
-      config.wet = (uint16_t)v;
+  if (extractJsonInt(body, "wet_threshold", v) && v >= 0 && v <= 1023) {
+    if (nextCfg.wet != (uint16_t)v) {
+      nextCfg.wet = (uint16_t)v;
       changed = true;
     }
   }
 
-  if (extractJsonInt(body, "timeout_ms", v)) {
-    if (v >= 1000 && v <= 3600000 && config.timeoutMs != (uint32_t)v) {
-      config.timeoutMs = (uint32_t)v;
+  if (extractJsonInt(body, "timeout_ms", v) && v >= 1000 && v <= 3600000) {
+    if (nextCfg.timeoutMs != (uint32_t)v) {
+      nextCfg.timeoutMs = (uint32_t)v;
       changed = true;
     }
   }
 
-  if (extractJsonInt(body, "safe_temp", v)) {
-    if (v >= -20 && v <= 80 && config.safeTemp != (int8_t)v) {
-      config.safeTemp = (int8_t)v;
+  if (extractJsonInt(body, "safe_temp", v) && v >= -20 && v <= 80) {
+    if (nextCfg.safeTemp != (int8_t)v) {
+      nextCfg.safeTemp = (int8_t)v;
       changed = true;
     }
   }
 
   if (extractJsonText(body, "pump_mode", modeBuf, sizeof(modeBuf))) {
     if (strcmp(modeBuf, "threshold") == 0 || strcmp(modeBuf, "schedule") == 0 || strcmp(modeBuf, "manual") == 0) {
-      if (strcmp((const char *)config.pumpMode, modeBuf) != 0) {
-        strncpy((char*)config.pumpMode, modeBuf, sizeof(config.pumpMode) - 1);
-        ((char*)config.pumpMode)[sizeof(config.pumpMode) - 1] = '\0';
+      if (strcmp(nextCfg.pumpMode, modeBuf) != 0) {
+        strncpy(nextCfg.pumpMode, modeBuf, sizeof(nextCfg.pumpMode) - 1);
+        nextCfg.pumpMode[sizeof(nextCfg.pumpMode) - 1] = '\0';
         changed = true;
       }
     }
   }
 
-  hasManualVal = extractJsonBool(body, "manual_trigger", manualVal);
-  if (hasManualVal && config.manualTrigger != manualVal) {
-    config.manualTrigger = manualVal;
+  if (extractJsonBool(body, "manual_trigger", manualVal) && nextCfg.manualTrigger != manualVal) {
+    nextCfg.manualTrigger = manualVal;
     changed = true;
   }
-  portEXIT_CRITICAL(&dataMux);
+
+  if (changed) {
+    portENTER_CRITICAL(&dataMux);
+    memcpy((void *)&config, &nextCfg, sizeof(ThresholdConfig));
+    portEXIT_CRITICAL(&dataMux);
+  }
 
   if (changed) {
     sendConfigToMainBoard();
@@ -361,8 +363,10 @@ void TaskSensor(void *pvParameters) {
   SensorFrame frame;
   for (;;) {
     int rawSoil = analogRead(SOIL_PIN);
-    int rawTemp = dht.readTemperature();
-    int rawHum = dht.readHumidity();
+    float tempRead = dht.readTemperature();
+    float humRead = dht.readHumidity();
+    int rawTemp = isnan(tempRead) ? 0 : (int)tempRead;
+    int rawHum = isnan(humRead) ? 0 : (int)humRead;
 
     if (rawTemp < -20 || rawTemp > 80) rawTemp = 0;
     if (rawHum < 0 || rawHum > 100) rawHum = 0;
@@ -374,9 +378,7 @@ void TaskSensor(void *pvParameters) {
     frame.soil = (uint16_t)rawSoil;
     frame.tsMs = millis();
 
-    portENTER_CRITICAL(&dataMux);
-    writeSensorFrameToVolatile(latestFrame, frame);
-    portEXIT_CRITICAL(&dataMux);
+    updateLatestFrame(frame);
 
     if (sensorQueue != NULL) {
       xQueueOverwrite(sensorQueue, &frame);
@@ -420,8 +422,8 @@ void TaskUART(void *pvParameters) {
       sendSensorToMainBoard(frame);
     }
 
-    while (Serial.available() > 0) {
-      char c = (char)Serial.read();
+    while (MAIN_SERIAL.available() > 0) {
+      char c = (char)MAIN_SERIAL.read();
 
       if (c == '\n') {
         rxLine[rxIdx] = '\0';
@@ -451,9 +453,7 @@ void TaskApiSync(void *pvParameters) {
     pushTelemetryToSupabase();
 
     ThresholdConfig snap;
-    portENTER_CRITICAL(&dataMux);
-    copyThresholdConfigFromVolatile(snap, config);
-    portEXIT_CRITICAL(&dataMux);
+    snapshotConfig(snap);
 
     int8_t overrideMode = calcPumpOverride(snap);
     if (overrideMode != lastOverrideSent) {
@@ -465,20 +465,9 @@ void TaskApiSync(void *pvParameters) {
   }
 }
 
-void TaskRuntime(void *pvParameters) {
-  (void) pvParameters;
-
-  for (;;) {
-    portENTER_CRITICAL(&dataMux);
-    runtimeSec++;
-    portEXIT_CRITICAL(&dataMux);
-
-    vTaskDelay(pdMS_TO_TICKS(RUNTIME_PERIOD_MS));
-  }
-}
-
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(UART_BAUD);
+  MAIN_SERIAL.begin(UART_BAUD, SERIAL_8N1, UART2_RX_PIN, UART2_TX_PIN);
 
   dht.begin();
 
@@ -494,18 +483,16 @@ void setup() {
 
   connectWifi();
   sendConfigToMainBoard();
+
   ThresholdConfig cfgSnap;
-  portENTER_CRITICAL(&dataMux);
-  copyThresholdConfigFromVolatile(cfgSnap, config);
-  portEXIT_CRITICAL(&dataMux);
+  snapshotConfig(cfgSnap);
   sendPumpOverrideToMainBoard(calcPumpOverride(cfgSnap));
 
   sensorQueue = xQueueCreate(1, sizeof(SensorFrame));
 
   xTaskCreate(TaskSensor, "Sensor", 3072, NULL, 2, NULL);
   xTaskCreate(TaskUART, "UART", 3072, NULL, 3, NULL);
-  xTaskCreate(TaskApiSync, "Api", 6144, NULL, 1, NULL);
-  xTaskCreate(TaskRuntime, "Run", 2048, NULL, 1, NULL);
+  xTaskCreate(TaskApiSync, "Api", 8192, NULL, 1, NULL);
 }
 
 void loop() {

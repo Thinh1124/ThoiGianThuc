@@ -1,11 +1,24 @@
+#if defined(ARDUINO_ARCH_AVR)
 #include <Arduino_FreeRTOS.h>
+#include <SoftwareSerial.h>
+#endif
 
 // ===== PIN =====
 #define RELAY_PIN 8
 #define LED_ERROR 13
 
-#define DEFAULT_DRY_THRESHOLD 900
-#define DEFAULT_WET_THRESHOLD 600
+#define LINK_RX_PIN 10
+#define LINK_TX_PIN 11
+#define LINK_BAUD 9600
+
+#if defined(ARDUINO_ARCH_AVR)
+SoftwareSerial linkSerial(LINK_RX_PIN, LINK_TX_PIN);
+#endif
+
+#define LINK_SERIAL linkSerial
+
+#define DEFAULT_DRY_THRESHOLD 1000
+#define DEFAULT_WET_THRESHOLD 800
 #define DEFAULT_SAFE_TEMP 32
 #define DEFAULT_SAFETY_TIMEOUT 600000UL
 
@@ -78,8 +91,8 @@ void Task_UART(void *pvParameters) {
   (void) pvParameters;
 
   for (;;) {
-    while (Serial.available()) {
-      char c = Serial.read();
+    while (LINK_SERIAL.available()) {
+      char c = LINK_SERIAL.read();
 
       if (c == '\n') {
         buffer[idx] = '\0';
@@ -104,6 +117,8 @@ void Task_UART(void *pvParameters) {
       } else {
         if (idx < sizeof(buffer) - 1) {
           buffer[idx++] = c;
+        } else {
+          idx = 0;
         }
       }
     }
@@ -188,8 +203,12 @@ void Task_Feedback(void *pvParameters) {
     uint32_t now = millis();
 
     if (currentPump != lastPumpState || (now - lastBeat) >= 1000UL) {
+      LINK_SERIAL.print(F("P:"));
+      LINK_SERIAL.println(currentPump);
+
       Serial.print(F("P:"));
       Serial.println(currentPump);
+
       lastPumpState = currentPump;
       lastBeat = now;
     }
@@ -201,6 +220,7 @@ void Task_Feedback(void *pvParameters) {
 // ================= SETUP =================
 void setup() {
   Serial.begin(9600);
+  LINK_SERIAL.begin(LINK_BAUD);
 
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(LED_ERROR, OUTPUT);
@@ -209,7 +229,9 @@ void setup() {
   xTaskCreate(Task_Control, "CTRL", 100, NULL, 2, NULL);
   xTaskCreate(Task_Feedback, "FB", 100, NULL, 1, NULL);
 
+#if defined(ARDUINO_ARCH_AVR)
   vTaskStartScheduler();
+#endif
 }
 
 void loop() {}
